@@ -408,6 +408,8 @@ func (h *Handler) writeErr(w http.ResponseWriter, r *http.Request, err error) {
 		writeErrJSON(w, http.StatusServiceUnavailable, "upstream service unavailable — request rejected", corrID)
 	case errors.Is(err, registry.ErrInvalidInput):
 		writeErrJSON(w, http.StatusBadRequest, err.Error(), corrID)
+	case errors.Is(err, registry.ErrConflict):
+		writeErrJSON(w, http.StatusConflict, err.Error(), corrID)
 	default:
 		h.log.Error("unhandled service error", zap.Error(err), zap.String("correlation_id", corrID))
 		writeErrJSON(w, http.StatusInternalServerError, "internal server error", corrID)

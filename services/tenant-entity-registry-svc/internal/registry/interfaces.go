@@ -33,10 +33,13 @@ type Store interface {
 	GetEntityByID(ctx context.Context, legalEntityID string) (*domain.LegalEntity, error)
 	ListEntitiesByTenant(ctx context.Context, tenantID string) ([]*domain.LegalEntity, error)
 	UpdateEntity(ctx context.Context, legalEntityID string, req domain.UpdateEntityRequest) (*domain.LegalEntity, error)
-	// TransitionEntityStatus applies an entity_status transition.
-	// Must be idempotent: applying the same target status is a no-op.
-	// Persistence only; callers are responsible for event publication.
-	TransitionEntityStatus(ctx context.Context, legalEntityID string, newStatus domain.EntityStatus, actorID, correlationID string) error
+	// TransitionEntityStatus atomically applies an entity_status transition.
+	// The UPDATE uses WHERE entity_status = ANY($allowedPriorStates) so the state
+	// machine check and the write are a single atomic statement — no separate read
+	// needed, no race window. Returns (rowsAffected, tenantID, error).
+	// rowsAffected == 0 means entity not found or state not in allowed set.
+	// tenantID is returned via RETURNING for event publishing without a second query.
+	TransitionEntityStatus(ctx context.Context, legalEntityID string, newStatus domain.EntityStatus, allowedPriorStates []domain.EntityStatus, actorID, correlationID string) (int64, string, error)
 	GetEntityStatus(ctx context.Context, legalEntityID string) (*domain.EntityStatusResponse, error)
 
 	// ── EntityHierarchy ─────────────────────────────────────────────────────

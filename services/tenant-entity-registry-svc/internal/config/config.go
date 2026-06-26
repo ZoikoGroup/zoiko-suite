@@ -57,7 +57,7 @@ func Load() (*Config, error) {
 			Name:     env("DB_NAME", "tenant_entity_registry"),
 			User:     env("DB_USER", "postgres"),
 			Password: env("DB_PASSWORD", ""),
-			SSLMode:  env("DB_SSLMODE", "disable"),
+			SSLMode:  env("DB_SSLMODE", "require"),
 		},
 		Kafka: KafkaConfig{
 			Brokers: strings.Split(env("KAFKA_BROKERS", "localhost:9092"), ","),

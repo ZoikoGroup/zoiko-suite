@@ -20,7 +20,9 @@ type Tenant struct {
 	DefaultDataResidencyPolicyID string            `json:"default_data_residency_policy_id"`
 	LifecycleState            TenantLifecycleState `json:"lifecycle_state"`
 	CreatedAt                 time.Time            `json:"created_at"`
-	CreatedBy                 string               `json:"created_by"` // principal_id
+	UpdatedAt                 time.Time            `json:"updated_at"`
+	CreatedByPrincipalID      string               `json:"created_by_principal_id"`
+	UpdatedByPrincipalID      string               `json:"updated_by_principal_id"`
 }
 
 // ---------------------------------------------------------------------------
@@ -48,6 +50,9 @@ type LegalEntity struct {
 	// No LegalEntity may be created without a valid residency policy.
 	DataResidencyPolicyID  string       `json:"data_residency_policy_id"`
 	CreatedAt              time.Time    `json:"created_at"`
+	UpdatedAt              time.Time    `json:"updated_at"`
+	CreatedByPrincipalID   string       `json:"created_by_principal_id"`
+	UpdatedByPrincipalID   string       `json:"updated_by_principal_id"`
 }
 
 // ---------------------------------------------------------------------------
@@ -63,6 +68,10 @@ type EntityHierarchy struct {
 	RelationshipType     HierarchyRelationshipType `json:"relationship_type"`
 	EffectiveFrom        time.Time                 `json:"effective_from"`
 	EffectiveTo          *time.Time                `json:"effective_to"` // nil = open-ended
+	CreatedAt            time.Time                 `json:"created_at"`
+	UpdatedAt            time.Time                 `json:"updated_at"`
+	CreatedByPrincipalID string                    `json:"created_by_principal_id"`
+	UpdatedByPrincipalID string                    `json:"updated_by_principal_id"`
 }
 
 // ---------------------------------------------------------------------------
@@ -72,12 +81,17 @@ type EntityHierarchy struct {
 
 type EntityJurisdictionAssignment struct {
 	AssignmentID    string                     `json:"assignment_id"`
+	TenantID        string                     `json:"tenant_id"`
 	LegalEntityID   string                     `json:"legal_entity_id"`
 	JurisdictionID  string                     `json:"jurisdiction_id"`
 	AssignmentType  JurisdictionAssignmentType `json:"assignment_type"`
 	EffectiveFrom   time.Time                  `json:"effective_from"`
 	EffectiveTo     *time.Time                 `json:"effective_to"` // nil = open-ended
 	SourceBasis     string                     `json:"source_basis"`
+	CreatedAt       time.Time                  `json:"created_at"`
+	UpdatedAt       time.Time                  `json:"updated_at"`
+	CreatedByPrincipalID string                `json:"created_by_principal_id"`
+	UpdatedByPrincipalID string                `json:"updated_by_principal_id"`
 }
 
 // ---------------------------------------------------------------------------
@@ -92,6 +106,10 @@ type DataResidencyPolicy struct {
 	ResidencyMode          ResidencyMode          `json:"residency_mode"`
 	ConflictResolutionMode ConflictResolutionMode `json:"conflict_resolution_mode"`
 	ActiveFlag             bool                   `json:"active_flag"`
+	CreatedAt              time.Time              `json:"created_at"`
+	UpdatedAt              time.Time              `json:"updated_at"`
+	CreatedByPrincipalID   string                 `json:"created_by_principal_id"`
+	UpdatedByPrincipalID   string                 `json:"updated_by_principal_id"`
 }
 
 // ---------------------------------------------------------------------------
@@ -107,6 +125,10 @@ type ResidencyRegion struct {
 	CountryCode       string `json:"country_code"`
 	SovereignFlag     bool   `json:"sovereign_flag"`
 	ActiveFlag        bool   `json:"active_flag"`
+	CreatedAt         time.Time `json:"created_at"`
+	UpdatedAt         time.Time `json:"updated_at"`
+	CreatedByPrincipalID string `json:"created_by_principal_id"`
+	UpdatedByPrincipalID string `json:"updated_by_principal_id"`
 }
 
 // ---------------------------------------------------------------------------
@@ -119,12 +141,17 @@ type ResidencyRegion struct {
 
 type TaxIdentityBundle struct {
 	TaxIdentityBundleID string                  `json:"tax_identity_bundle_id"`
+	TenantID            string                  `json:"tenant_id"`
 	LegalEntityID       string                  `json:"legal_entity_id"`
 	// JurisdictionID validated against Jurisdiction Rules Service at creation time.
 	JurisdictionID      string                  `json:"jurisdiction_id"`
 	Status              TaxIdentityBundleStatus `json:"status"`
 	EffectiveFrom       time.Time               `json:"effective_from"`
 	EffectiveTo         *time.Time              `json:"effective_to"`
+	CreatedAt           time.Time               `json:"created_at"`
+	UpdatedAt           time.Time               `json:"updated_at"`
+	CreatedByPrincipalID string                 `json:"created_by_principal_id"`
+	UpdatedByPrincipalID string                 `json:"updated_by_principal_id"`
 }
 
 // ---------------------------------------------------------------------------

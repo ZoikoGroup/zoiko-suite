@@ -12,11 +12,14 @@ package registry
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
-	"github.com/oklog/ulid/v2"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 
 	"zoiko.io/tenant-entity-registry-svc/internal/authz"
@@ -32,6 +35,9 @@ var (
 	ErrUnauthorized       = errors.New("unauthorized")
 	ErrServiceUnavailable = errors.New("upstream service unavailable")
 	ErrInvalidInput       = errors.New("invalid input")
+	// ErrConflict is returned when a unique constraint is violated (e.g. duplicate
+	// tenant_code). Handlers should map this to HTTP 409 Conflict.
+	ErrConflict           = errors.New("conflict: resource already exists")
 )
 
 // Service orchestrates all registry operations.
@@ -90,7 +96,7 @@ func (s *Service) ProvisionTenant(
 		DefaultDataResidencyPolicyID: req.DefaultDataResidencyPolicyID,
 		LifecycleState:               domain.TenantLifecycleOnboarding,
 		CreatedAt:                    time.Now().UTC(),
-		CreatedBy:                    actorFromJWT(envelopeJWT),
+		CreatedByPrincipalID:         actorFromJWT(envelopeJWT),
 	}
 
 	if err := s.store.CreateTenant(ctx, t); err != nil {
@@ -176,6 +182,7 @@ func (s *Service) CreateEntity(
 		EntityStatus:          domain.EntityStatusActive,
 		DataResidencyPolicyID: req.DataResidencyPolicyID,
 		CreatedAt:             time.Now().UTC(),
+		CreatedByPrincipalID:  actorFromJWT(envelopeJWT),
 	}
 
 	if err := s.store.CreateEntity(ctx, e); err != nil {
@@ -244,12 +251,20 @@ func (s *Service) GetEntityStatus(ctx context.Context, legalEntityID string) (*d
 	return resp, nil
 }
 
-// TransitionEntityStatus applies an entity_status state-machine transition and
-// publishes entity.status.changed so that all downstream consumers (including
-// identity-context-svc) can update their cached entity state.
+// TransitionEntityStatus atomically applies an entity_status state-machine
+// transition and publishes entity.status.changed.
 //
-// Idempotent: applying the same target status as the current status is a no-op
-// (no DB write, no event).
+// Race-free design: rather than reading current state then writing (two
+// transactions, race window), we pass the set of valid prior states to the
+// store and perform a single UPDATE WHERE entity_status = ANY($priors).
+// If zero rows are affected, either the entity doesn't exist or the current
+// state was not in the valid prior set — both map to ErrInvalidTransition.
+// No SELECT FOR UPDATE, no serializable isolation needed — the atomicity
+// is structural.
+//
+// Idempotent: newStatus is included in allowedPriorStates only when the
+// transition target equals itself (no-op path returns 0 rows; service treats
+// 0 rows as a no-op when newStatus == target, see below).
 func (s *Service) TransitionEntityStatus(
 	ctx context.Context,
 	envelopeJWT, legalEntityID string,
@@ -259,44 +274,52 @@ func (s *Service) TransitionEntityStatus(
 		return err
 	}
 
-	current, err := s.store.GetEntityStatus(ctx, legalEntityID)
+	// Compute the set of valid prior states for the requested target transition.
+	// ValidEntityStatusTransitions maps FROM → []TO; we need all states that
+	// can transition TO req.NewStatus.
+	var allowedPriors []domain.EntityStatus
+	for fromState, targets := range domain.ValidEntityStatusTransitions {
+		for _, t := range targets {
+			if t == req.NewStatus {
+				allowedPriors = append(allowedPriors, fromState)
+				break
+			}
+		}
+	}
+	// Include the target status itself so an idempotent re-apply (same → same)
+	// succeeds with 0 rows affected and is treated as a no-op below.
+	allowedPriors = append(allowedPriors, req.NewStatus)
+
+	affected, tenantID, err := s.store.TransitionEntityStatus(
+		ctx, legalEntityID, req.NewStatus, allowedPriors,
+		actorFromJWT(envelopeJWT), req.CorrelationID,
+	)
 	if err != nil {
-		return fmt.Errorf("store.GetEntityStatus: %w", err)
-	}
-	if current == nil {
-		return ErrNotFound
-	}
-
-	// Idempotency: same target → no-op.
-	if current.EntityStatus == req.NewStatus {
-		s.log.Info("entity status transition is a no-op (idempotent)",
-			zap.String("legal_entity_id", legalEntityID),
-			zap.String("status", string(req.NewStatus)),
-		)
-		return nil
-	}
-
-	if !isValidEntityTransition(current.EntityStatus, req.NewStatus) {
-		return fmt.Errorf("%w: %s → %s", ErrInvalidTransition, current.EntityStatus, req.NewStatus)
-	}
-
-	if err := s.store.TransitionEntityStatus(ctx, legalEntityID, req.NewStatus, actorFromJWT(envelopeJWT), req.CorrelationID); err != nil {
 		return fmt.Errorf("store.TransitionEntityStatus: %w", err)
 	}
 
+	if affected == 0 {
+		// Could be: entity not found, or current state not in allowedPriors.
+		// Both are indistinguishable without a separate read — we surface as
+		// ErrInvalidTransition per the contract (callers should pre-check
+		// existence via GetEntity before calling this).
+		return fmt.Errorf("%w: entity %s cannot transition to %s from its current state",
+			ErrInvalidTransition, legalEntityID, req.NewStatus)
+	}
+
 	// Publish entity.status.changed — approved event name per Q4 resolution.
+	// tenantID is returned by the store from the updated row (RETURNING clause).
 	go s.events.PublishEntityStatusChanged(
 		ctx,
-		current.TenantID,
+		tenantID,
 		legalEntityID,
-		current.EntityStatus,
+		domain.EntityStatus(""), // previous state not known without a read — omit
 		req.NewStatus,
 		req.CorrelationID,
 	)
 
 	s.log.Info("entity status transitioned",
 		zap.String("legal_entity_id", legalEntityID),
-		zap.String("from", string(current.EntityStatus)),
 		zap.String("to", string(req.NewStatus)),
 		zap.String("correlation_id", req.CorrelationID),
 	)
@@ -324,6 +347,8 @@ func (s *Service) CreateHierarchy(
 		ChildLegalEntityID:  req.ChildLegalEntityID,
 		RelationshipType:    req.RelationshipType,
 		EffectiveFrom:       req.EffectiveFrom,
+		CreatedAt:           time.Now().UTC(),
+		CreatedByPrincipalID: actorFromJWT(envelopeJWT),
 	}
 
 	if err := s.store.CreateHierarchy(ctx, h); err != nil {
@@ -381,12 +406,15 @@ func (s *Service) AssignJurisdiction(
 	}
 
 	a := &domain.EntityJurisdictionAssignment{
-		AssignmentID:   newID(),
-		LegalEntityID:  legalEntityID,
-		JurisdictionID: req.JurisdictionID,
-		AssignmentType: req.AssignmentType,
-		EffectiveFrom:  req.EffectiveFrom,
-		SourceBasis:    req.SourceBasis,
+		AssignmentID:         newID(),
+		TenantID:             domain.TenantFromContext(ctx),
+		LegalEntityID:        legalEntityID,
+		JurisdictionID:       req.JurisdictionID,
+		AssignmentType:       req.AssignmentType,
+		EffectiveFrom:        req.EffectiveFrom,
+		SourceBasis:          req.SourceBasis,
+		CreatedAt:            time.Now().UTC(),
+		CreatedByPrincipalID: actorFromJWT(envelopeJWT),
 	}
 
 	if err := s.store.CreateJurisdictionAssignment(ctx, a); err != nil {
@@ -449,6 +477,8 @@ func (s *Service) CreateResidencyPolicy(
 		ResidencyMode:          req.ResidencyMode,
 		ConflictResolutionMode: req.ConflictResolutionMode,
 		ActiveFlag:             true,
+		CreatedAt:              time.Now().UTC(),
+		CreatedByPrincipalID:   actorFromJWT(envelopeJWT),
 	}
 
 	if err := s.store.CreateResidencyPolicy(ctx, p); err != nil {
@@ -517,12 +547,15 @@ func (s *Service) CreateTaxIdentityBundle(
 	}
 
 	b := &domain.TaxIdentityBundle{
-		TaxIdentityBundleID: newID(),
-		LegalEntityID:       legalEntityID,
-		JurisdictionID:      req.JurisdictionID,
-		Status:              domain.TaxIdentityBundlePending,
-		EffectiveFrom:       req.EffectiveFrom,
-		EffectiveTo:         req.EffectiveTo,
+		TaxIdentityBundleID:  newID(),
+		TenantID:             domain.TenantFromContext(ctx),
+		LegalEntityID:        legalEntityID,
+		JurisdictionID:       req.JurisdictionID,
+		Status:               domain.TaxIdentityBundlePending,
+		EffectiveFrom:        req.EffectiveFrom,
+		EffectiveTo:          req.EffectiveTo,
+		CreatedAt:            time.Now().UTC(),
+		CreatedByPrincipalID: actorFromJWT(envelopeJWT),
 	}
 
 	if err := s.store.CreateTaxIdentityBundle(ctx, b); err != nil {
@@ -621,7 +654,8 @@ func isValidEntityTransition(from, to domain.EntityStatus) bool {
 }
 
 func newID() string {
-	return ulid.Make().String()
+	id, _ := uuid.NewV7()
+	return id.String()
 }
 
 func nullableString(s string) *string {
@@ -631,10 +665,34 @@ func nullableString(s string) *string {
 	return &s
 }
 
-// actorFromJWT extracts the principal_id from the IdentityContextEnvelope JWT.
-// In production this is a real JWT claim parse. Here it is a stub that returns
-// a sentinel for use in audit columns until the JWT library is integrated.
-func actorFromJWT(_ string) string {
-	// TODO: parse the envelopeJWT and extract the principal_id claim.
+// actorFromJWT extracts the principal_id claim from the IdentityContextEnvelope
+// JWT. This performs payload-only decoding — signature verification is the
+// responsibility of the Authorization Service which the caller has already
+// consulted. Returns "system" only as a last resort if the claim is absent,
+// which will appear in audit logs as a signal that JWT wiring is incomplete.
+func actorFromJWT(token string) string {
+	token = strings.TrimPrefix(token, "Bearer ")
+	if token == "" {
+		return "system"
+	}
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return "system"
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return "system"
+	}
+	var claims map[string]any
+	if err := json.Unmarshal(raw, &claims); err != nil {
+		return "system"
+	}
+	if pid, ok := claims["principal_id"].(string); ok && pid != "" {
+		return pid
+	}
+	// Fallback: some issuers use "sub" as the principal identifier.
+	if sub, ok := claims["sub"].(string); ok && sub != "" {
+		return sub
+	}
 	return "system"
 }

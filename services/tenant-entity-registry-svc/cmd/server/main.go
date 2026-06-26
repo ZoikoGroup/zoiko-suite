@@ -31,6 +31,7 @@ import (
 	"zoiko.io/tenant-entity-registry-svc/internal/handler"
 	"zoiko.io/tenant-entity-registry-svc/internal/health"
 	"zoiko.io/tenant-entity-registry-svc/internal/jurisdiction"
+	svcmiddleware "zoiko.io/tenant-entity-registry-svc/internal/middleware"
 	"zoiko.io/tenant-entity-registry-svc/internal/registry"
 	"zoiko.io/tenant-entity-registry-svc/internal/store"
 )
@@ -60,7 +61,18 @@ func main() {
 	)
 
 	// ── 3. Database pool ─────────────────────────────────────────────────────
-	pool, err := pgxpool.New(context.Background(), cfg.DB.DSN())
+	// F8: explicit pool configuration for a Tier 0 service.
+	poolCfg, err := pgxpool.ParseConfig(cfg.DB.DSN())
+	if err != nil {
+		log.Fatal("failed to parse db pool config", zap.Error(err))
+	}
+	poolCfg.MaxConns = 20
+	poolCfg.MinConns = 2
+	poolCfg.MaxConnLifetime = 30 * time.Minute
+	poolCfg.MaxConnIdleTime = 5 * time.Minute
+	poolCfg.HealthCheckPeriod = 1 * time.Minute
+
+	pool, err := pgxpool.NewWithConfig(context.Background(), poolCfg)
 	if err != nil {
 		log.Fatal("failed to create db pool", zap.Error(err))
 	}
@@ -110,6 +122,9 @@ func main() {
 	r.Use(middleware.RealIP)
 	r.Use(middleware.Recoverer)
 	r.Use(correlationIDMiddleware)
+	// F1: extract tenant_id from JWT into context so every DB call can set
+	// app.tenant_id on the Postgres session and RLS is actually enforced.
+	r.Use(svcmiddleware.TenantContext(log))
 	r.Use(middleware.Logger)
 
 	h := handler.New(svc, log)

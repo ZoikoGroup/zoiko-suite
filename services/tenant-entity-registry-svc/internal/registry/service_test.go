@@ -2,7 +2,6 @@ package registry_test
 
 import (
 	"context"
-	"errors"
 	"testing"
 	"time"
 
@@ -66,14 +65,41 @@ func (m *memStore) GetEntityByID(_ context.Context, id string) (*domain.LegalEnt
 func (m *memStore) ListEntitiesByTenant(_ context.Context, _ string) ([]*domain.LegalEntity, error) {
 	return []*domain.LegalEntity{}, nil
 }
-func (m *memStore) UpdateEntity(_ context.Context, _ string, _ domain.UpdateEntityRequest) (*domain.LegalEntity, error) {
-	return nil, errors.New("not implemented in stub")
-}
-func (m *memStore) TransitionEntityStatus(_ context.Context, id string, status domain.EntityStatus, _, _ string) error {
-	if e, ok := m.entities[id]; ok {
-		e.EntityStatus = status
+func (m *memStore) UpdateEntity(_ context.Context, id string, req domain.UpdateEntityRequest) (*domain.LegalEntity, error) {
+	e, ok := m.entities[id]
+	if !ok {
+		return nil, nil
 	}
-	return nil
+	if req.LegalName != nil {
+		e.LegalName = *req.LegalName
+	}
+	if req.TradingName != nil {
+		e.TradingName = req.TradingName
+	}
+	if req.DefaultCurrencyCode != nil {
+		e.DefaultCurrencyCode = *req.DefaultCurrencyCode
+	}
+	return e, nil
+}
+func (m *memStore) TransitionEntityStatus(_ context.Context, id string, status domain.EntityStatus, allowedPriors []domain.EntityStatus, _, _ string) (int64, string, error) {
+	e, ok := m.entities[id]
+	if !ok {
+		return 0, "", nil
+	}
+	// Check whether current state is in allowedPriors (faithful emulation of DB ANY clause).
+	current := e.EntityStatus
+	inPriors := false
+	for _, p := range allowedPriors {
+		if p == current {
+			inPriors = true
+			break
+		}
+	}
+	if !inPriors {
+		return 0, "", nil
+	}
+	e.EntityStatus = status
+	return 1, e.TenantID, nil
 }
 func (m *memStore) GetEntityStatus(_ context.Context, id string) (*domain.EntityStatusResponse, error) {
 	e, ok := m.entities[id]
