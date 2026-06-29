@@ -97,13 +97,29 @@ func (r *Resolver) Resolve(ctx context.Context, req domain.ResolveRequest) (stri
 	// ── Dimension 1: Verify inbound token → authenticated principal ─────────
 	claims, err := r.verifyToken(ctx, req)
 	if err != nil {
-		go r.events.PublishResolutionFailed(ctx, "unknown", req.CorrelationID, "token_invalid")
+		go func() {
+			if err := r.events.PublishResolutionFailed(ctx, "unknown", req.CorrelationID, "token_invalid"); err != nil {
+				r.log.Error("event publish failed",
+					zap.String("event_type", "identity.context.resolution_failed"),
+					zap.String("subject", "unknown"),
+					zap.Error(err),
+				)
+			}
+		}()
 		return "", fmt.Errorf("%w: %v", ErrTokenInvalid, err)
 	}
 
 	principal, err := r.principals.FindByIDPSubject(ctx, claims.Subject, claims.TenantID)
 	if err != nil || principal == nil || principal.Status != domain.PrincipalStatusActive {
-		go r.events.PublishResolutionFailed(ctx, claims.Subject, req.CorrelationID, "principal_inactive_or_not_found")
+		go func() {
+			if err := r.events.PublishResolutionFailed(ctx, claims.Subject, req.CorrelationID, "principal_inactive_or_not_found"); err != nil {
+				r.log.Error("event publish failed",
+					zap.String("event_type", "identity.context.resolution_failed"),
+					zap.String("subject", claims.Subject),
+					zap.Error(err),
+				)
+			}
+		}()
 		return "", ErrPrincipalInactive
 	}
 
@@ -144,7 +160,15 @@ func (r *Resolver) Resolve(ctx context.Context, req domain.ResolveRequest) (stri
 		return "", err
 	}
 	if posture == domain.TrustPostureBlocked {
-		go r.events.PublishResolutionFailed(ctx, principal.PrincipalID, req.CorrelationID, "trust_posture_blocked")
+		go func() {
+			if err := r.events.PublishResolutionFailed(ctx, principal.PrincipalID, req.CorrelationID, "trust_posture_blocked"); err != nil {
+				r.log.Error("event publish failed",
+					zap.String("event_type", "identity.context.resolution_failed"),
+					zap.String("principal_id", principal.PrincipalID),
+					zap.Error(err),
+				)
+			}
+		}()
 		return "", ErrTrustPostureBlocked
 	}
 
@@ -242,7 +266,15 @@ func (r *Resolver) Resolve(ctx context.Context, req domain.ResolveRequest) (stri
 	}
 
 	// Publish evidence event (non-blocking)
-	go r.events.PublishContextResolved(ctx, principal.PrincipalID, principal.TenantID, req.LegalEntityID, sessionContextID, req.CorrelationID)
+	go func() {
+		if err := r.events.PublishContextResolved(ctx, principal.PrincipalID, principal.TenantID, req.LegalEntityID, sessionContextID, req.CorrelationID); err != nil {
+			r.log.Error("event publish failed",
+				zap.String("event_type", "identity.context.resolved"),
+				zap.String("principal_id", principal.PrincipalID),
+				zap.Error(err),
+			)
+		}
+	}()
 
 	r.log.Info("identity.context.resolved",
 		zap.String("principal_id", principal.PrincipalID),
@@ -285,7 +317,15 @@ func (r *Resolver) InvalidateSession(
 		r.log.Warn("failed to evict session JWT from cache", zap.String("session_context_id", sessionContextID), zap.Error(err))
 	}
 
-	go r.events.PublishSessionInvalidated(ctx, sessionContextID, existing.PrincipalID, reason, correlationID)
+	go func() {
+		if err := r.events.PublishSessionInvalidated(ctx, sessionContextID, existing.PrincipalID, reason, correlationID); err != nil {
+			r.log.Error("event publish failed",
+				zap.String("event_type", "session.invalidated"),
+				zap.String("session_context_id", sessionContextID),
+				zap.Error(err),
+			)
+		}
+	}()
 
 	r.log.Info("session.invalidated",
 		zap.String("session_context_id", sessionContextID),
@@ -359,7 +399,15 @@ func (r *Resolver) resolveTrustPosture(
 			zap.String("principal_id", principalID),
 			zap.String("correlation_id", correlationID),
 		)
-		go r.events.PublishRiskSignalUnavailable(ctx, principalID, correlationID)
+		go func() {
+			if err := r.events.PublishRiskSignalUnavailable(ctx, principalID, correlationID); err != nil {
+				r.log.Error("event publish failed",
+					zap.String("event_type", "session.risk.changed"),
+					zap.String("principal_id", principalID),
+					zap.Error(err),
+				)
+			}
+		}()
 	} else {
 		riskScore = signal.SignalValue
 		riskSource = signal.SignalSource
