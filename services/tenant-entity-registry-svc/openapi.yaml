@@ -1,0 +1,947 @@
+openapi: "3.1.0"
+
+info:
+  title: Tenant & Entity Registry Service
+  version: "1.0.0"
+  description: |
+    Authoritative registry for ZoikoSuite tenants, legal entities, entity hierarchies,
+    jurisdiction assignments, data residency policies, residency regions (read-only),
+    and TaxIdentityBundle headers.
+
+    **Governance invariants:**
+    - All mutating endpoints require a valid `Authorization: Bearer <IdentityContextEnvelope JWT>`.
+    - Every mutating request must carry `X-Correlation-ID` for evidence propagation.
+    - ResidencyRegion is IaC-managed — no write endpoints are exposed.
+    - TaxIdentityBundle stores only the structural header (legal_entity_id, jurisdiction_id,
+      effective dates, status). Tax identifier values are owned by the Tax Service.
+    - jurisdiction_id references on EntityJurisdictionAssignment and TaxIdentityBundle are
+      validated synchronously against the Jurisdiction Rules Service (fail-closed).
+    - Entity status transitions publish `entity.status.changed` on the event backbone.
+
+servers:
+  - url: http://localhost:8081
+    description: Local development
+  - url: https://api.zoiko.internal/tenant-entity-registry
+    description: Internal cluster ingress
+
+tags:
+  - name: Tenants
+    description: Tenant provisioning and lifecycle management
+  - name: Entities
+    description: Legal entity CRUD, status probe, and status transitions
+  - name: Hierarchies
+    description: Effective-dated parent-child entity relationships
+  - name: Jurisdictions
+    description: Effective-dated jurisdiction assignments for entities
+  - name: ResidencyPolicies
+    description: Data residency policy management
+  - name: ResidencyRegions
+    description: IaC-managed hosting regions (read-only)
+  - name: TaxIdentityBundles
+    description: Structural tax identity headers (no tax identifier values stored here)
+  - name: Health
+    description: Liveness and readiness probes
+
+paths:
+
+  # ── Tenants ────────────────────────────────────────────────────────────────
+
+  /v1/tenants:
+    post:
+      operationId: provisionTenant
+      summary: Provision a new tenant
+      tags: [Tenants]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProvisionTenantRequest"
+      responses:
+        "201":
+          description: Tenant provisioned
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Tenant"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+
+  /v1/tenants/{tenantID}:
+    get:
+      operationId: getTenant
+      summary: Get a tenant by ID
+      tags: [Tenants]
+      parameters:
+        - $ref: "#/components/parameters/TenantID"
+      responses:
+        "200":
+          description: Tenant record
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Tenant"
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/tenants/{tenantID}/lifecycle:
+    post:
+      operationId: transitionTenantLifecycle
+      summary: Transition a tenant's lifecycle state
+      description: |
+        Valid transitions: ONBOARDING→ACTIVE, ACTIVE→SUSPENDED, ACTIVE→OFFBOARDING,
+        SUSPENDED→ACTIVE, SUSPENDED→OFFBOARDING. OFFBOARDING is terminal.
+      tags: [Tenants]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/TenantID"
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TransitionTenantLifecycleRequest"
+      responses:
+        "204": { description: Transition applied }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/UnprocessableEntity" }
+
+  # ── Entities ───────────────────────────────────────────────────────────────
+
+  /v1/entities:
+    post:
+      operationId: createEntity
+      summary: Create a new legal entity
+      description: |
+        `primary_jurisdiction_id` is validated synchronously against the
+        Jurisdiction Rules Service before the entity is persisted (fail-closed).
+      tags: [Entities]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateEntityRequest"
+      responses:
+        "201":
+          description: Entity created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LegalEntity"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+
+  /v1/tenants/{tenantID}/entities:
+    get:
+      operationId: listEntities
+      summary: List all legal entities for a tenant
+      tags: [Entities]
+      parameters:
+        - $ref: "#/components/parameters/TenantID"
+      responses:
+        "200":
+          description: Entity list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/LegalEntity"
+
+  /v1/entities/{entityID}:
+    get:
+      operationId: getEntity
+      summary: Get a legal entity by ID
+      tags: [Entities]
+      parameters:
+        - $ref: "#/components/parameters/EntityID"
+      responses:
+        "200":
+          description: Legal entity
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LegalEntity"
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      operationId: updateEntity
+      summary: Update mutable fields on a legal entity
+      description: |
+        Only non-governance fields are patchable: legal_name, trading_name,
+        default_currency_code. Status, jurisdiction, and hierarchy are managed
+        through dedicated endpoints.
+      tags: [Entities]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/EntityID"
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateEntityRequest"
+      responses:
+        "200":
+          description: Updated entity
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LegalEntity"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/entities/{entityID}/status:
+    get:
+      operationId: getEntityStatus
+      summary: Entity status probe
+      description: |
+        Lightweight status probe — returns entity_id, tenant_id, and entity_status
+        without the full entity payload. Designed for high-frequency polling by
+        downstream services (e.g. identity-context-svc on cache miss).
+        Renamed from the draft probe path per approved design decisions.
+      tags: [Entities]
+      parameters:
+        - $ref: "#/components/parameters/EntityID"
+      responses:
+        "200":
+          description: Entity status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EntityStatusResponse"
+        "404": { $ref: "#/components/responses/NotFound" }
+    post:
+      operationId: transitionEntityStatus
+      summary: Transition an entity's status
+      description: |
+        Valid transitions: ACTIVE→DORMANT, ACTIVE→SUSPENDED, ACTIVE→DISSOLVED,
+        DORMANT→ACTIVE, DORMANT→DISSOLVED, SUSPENDED→ACTIVE, SUSPENDED→DISSOLVED.
+        DISSOLVED is terminal. Idempotent — same target status is a no-op.
+        Publishes `entity.status.changed` on every successful transition.
+      tags: [Entities]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/EntityID"
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TransitionEntityStatusRequest"
+      responses:
+        "204": { description: Transition applied (or idempotent no-op) }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/UnprocessableEntity" }
+
+  # ── Hierarchies ────────────────────────────────────────────────────────────
+
+  /v1/entity-hierarchies:
+    post:
+      operationId: createHierarchy
+      summary: Create an effective-dated parent-child hierarchy
+      tags: [Hierarchies]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateHierarchyRequest"
+      responses:
+        "201":
+          description: Hierarchy created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EntityHierarchy"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /v1/entities/{entityID}/hierarchies:
+    get:
+      operationId: listHierarchies
+      summary: List all hierarchy records for an entity
+      tags: [Hierarchies]
+      parameters:
+        - $ref: "#/components/parameters/EntityID"
+      responses:
+        "200":
+          description: Hierarchy list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/EntityHierarchy"
+
+  /v1/entity-hierarchies/{hierarchyID}:
+    delete:
+      operationId: endDateHierarchy
+      summary: End-date a hierarchy relationship
+      description: |
+        Closes the relationship by setting effective_to. No hard-delete per doctrine.
+        `end_date` query parameter is required (RFC3339 format).
+      tags: [Hierarchies]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: hierarchyID
+          in: path
+          required: true
+          schema:
+            type: string
+        - $ref: "#/components/parameters/CorrelationID"
+        - name: end_date
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date-time
+      responses:
+        "204": { description: Hierarchy end-dated }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  # ── Jurisdiction assignments ───────────────────────────────────────────────
+
+  /v1/entities/{entityID}/jurisdictions:
+    get:
+      operationId: listJurisdictions
+      summary: List effective-dated jurisdiction assignments for an entity
+      tags: [Jurisdictions]
+      parameters:
+        - $ref: "#/components/parameters/EntityID"
+      responses:
+        "200":
+          description: Jurisdiction assignment list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/EntityJurisdictionAssignment"
+    post:
+      operationId: assignJurisdiction
+      summary: Assign a jurisdiction to a legal entity
+      description: |
+        jurisdiction_id is validated synchronously against the Jurisdiction Rules
+        Service before persistence. If the service is unreachable the request is
+        rejected (fail-closed) — a bad jurisdiction reference would silently
+        propagate tax, payroll, and filing failures across the platform.
+      tags: [Jurisdictions]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/EntityID"
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AssignJurisdictionRequest"
+      responses:
+        "201":
+          description: Assignment created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EntityJurisdictionAssignment"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+
+  /v1/entity-jurisdictions/{assignmentID}:
+    delete:
+      operationId: endDateJurisdictionAssignment
+      summary: End-date a jurisdiction assignment
+      description: |
+        Closes the assignment by setting effective_to. No hard-delete per doctrine.
+        `end_date` query parameter is required (RFC3339).
+      tags: [Jurisdictions]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: assignmentID
+          in: path
+          required: true
+          schema:
+            type: string
+        - $ref: "#/components/parameters/CorrelationID"
+        - name: end_date
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date-time
+      responses:
+        "204": { description: Assignment end-dated }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  # ── Data Residency Policies ────────────────────────────────────────────────
+
+  /v1/residency-policies:
+    post:
+      operationId: createResidencyPolicy
+      summary: Create a data residency policy for a tenant
+      tags: [ResidencyPolicies]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateResidencyPolicyRequest"
+      responses:
+        "201":
+          description: Policy created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DataResidencyPolicy"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /v1/residency-policies/{policyID}:
+    get:
+      operationId: getResidencyPolicy
+      summary: Get a residency policy by ID
+      tags: [ResidencyPolicies]
+      parameters:
+        - name: policyID
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Residency policy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DataResidencyPolicy"
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  # ── Residency Regions (IaC-managed — read-only) ───────────────────────────
+
+  /v1/residency-regions:
+    get:
+      operationId: listResidencyRegions
+      summary: List all active residency regions
+      description: |
+        ResidencyRegion records are IaC-provisioned (Terraform/CDK).
+        No write endpoints exist on this service.
+      tags: [ResidencyRegions]
+      responses:
+        "200":
+          description: Region list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ResidencyRegion"
+
+  /v1/residency-regions/{regionID}:
+    get:
+      operationId: getResidencyRegion
+      summary: Get a residency region by ID
+      tags: [ResidencyRegions]
+      parameters:
+        - name: regionID
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Residency region
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ResidencyRegion"
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  # ── TaxIdentityBundles ─────────────────────────────────────────────────────
+
+  /v1/entities/{entityID}/tax-identity-bundles:
+    get:
+      operationId: listTaxIdentityBundles
+      summary: List all TaxIdentityBundle headers for an entity
+      tags: [TaxIdentityBundles]
+      parameters:
+        - $ref: "#/components/parameters/EntityID"
+      responses:
+        "200":
+          description: Bundle header list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/TaxIdentityBundle"
+    post:
+      operationId: createTaxIdentityBundle
+      summary: Create a TaxIdentityBundle header for an entity
+      description: |
+        Stores the structural header only: legal_entity_id, jurisdiction_id,
+        effective dates, and status. No tax identifier values are stored here.
+        The actual tax registration number and all evidence artifacts are owned
+        by the Tax Service.
+
+        jurisdiction_id is validated synchronously (fail-closed).
+      tags: [TaxIdentityBundles]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/EntityID"
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateTaxIdentityBundleRequest"
+      responses:
+        "201":
+          description: Bundle header created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaxIdentityBundle"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+
+  /v1/tax-identity-bundles/{bundleID}:
+    get:
+      operationId: getTaxIdentityBundle
+      summary: Get a TaxIdentityBundle header by ID
+      tags: [TaxIdentityBundles]
+      parameters:
+        - name: bundleID
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Bundle header
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaxIdentityBundle"
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/tax-identity-bundles/{bundleID}/status:
+    post:
+      operationId: transitionTaxIdentityBundleStatus
+      summary: Transition a TaxIdentityBundle header status
+      description: |
+        Valid statuses: PENDING, ACTIVE, EXPIRED, SUPERSEDED.
+        Idempotent — same target status is a no-op.
+      tags: [TaxIdentityBundles]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: bundleID
+          in: path
+          required: true
+          schema:
+            type: string
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TransitionTaxIdentityBundleStatusRequest"
+      responses:
+        "204": { description: Status transitioned }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  # ── Health ─────────────────────────────────────────────────────────────────
+
+  /healthz:
+    get:
+      operationId: liveness
+      summary: Liveness probe
+      tags: [Health]
+      responses:
+        "200":
+          description: Process alive
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+
+  /readyz:
+    get:
+      operationId: readiness
+      summary: Readiness probe
+      description: Returns 200 only if the DB pool is reachable.
+      tags: [Health]
+      responses:
+        "200":
+          description: Service ready
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+        "503":
+          description: DB unreachable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+
+# ── Components ────────────────────────────────────────────────────────────────
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        IdentityContextEnvelope JWT issued by identity-context-svc.
+        Verified by the Authorization Service on every material action.
+
+  parameters:
+    TenantID:
+      name: tenantID
+      in: path
+      required: true
+      schema:
+        type: string
+    EntityID:
+      name: entityID
+      in: path
+      required: true
+      schema:
+        type: string
+    CorrelationID:
+      name: X-Correlation-ID
+      in: header
+      required: false
+      schema:
+        type: string
+      description: |
+        Propagated through every request for evidence and distributed tracing.
+        If absent, the service generates one from the request ID.
+
+  schemas:
+
+    # ── Tenant ────────────────────────────────────────────────────────────────
+
+    Tenant:
+      type: object
+      properties:
+        tenant_id:           { type: string }
+        tenant_code:         { type: string }
+        legal_name:          { type: string }
+        trading_name:        { type: string, nullable: true }
+        status:              { type: string, enum: [ACTIVE, SUSPENDED, ARCHIVED] }
+        default_currency_code: { type: string }
+        primary_timezone:    { type: string }
+        primary_locale:      { type: string }
+        default_data_residency_policy_id: { type: string }
+        lifecycle_state:     { type: string, enum: [ONBOARDING, ACTIVE, SUSPENDED, OFFBOARDING] }
+        created_at:          { type: string, format: date-time }
+        created_by:          { type: string }
+
+    ProvisionTenantRequest:
+      type: object
+      required: [tenant_code, legal_name, default_currency_code, primary_timezone, primary_locale, default_data_residency_policy_id]
+      properties:
+        tenant_code:         { type: string }
+        legal_name:          { type: string }
+        trading_name:        { type: string }
+        default_currency_code: { type: string }
+        primary_timezone:    { type: string }
+        primary_locale:      { type: string }
+        default_data_residency_policy_id: { type: string }
+
+    TransitionTenantLifecycleRequest:
+      type: object
+      required: [target_state, correlation_id]
+      properties:
+        target_state:
+          type: string
+          enum: [ACTIVE, SUSPENDED, OFFBOARDING]
+        correlation_id: { type: string }
+
+    # ── LegalEntity ───────────────────────────────────────────────────────────
+
+    LegalEntity:
+      type: object
+      properties:
+        legal_entity_id:        { type: string }
+        tenant_id:              { type: string }
+        entity_code:            { type: string }
+        legal_name:             { type: string }
+        trading_name:           { type: string, nullable: true }
+        registration_number:    { type: string, nullable: true }
+        tax_identity_bundle_id: { type: string, nullable: true }
+        entity_type:            { type: string, enum: [SUBSIDIARY, BRANCH, HOLDING, OPERATIONAL] }
+        incorporation_date:     { type: string, format: date, nullable: true }
+        default_currency_code:  { type: string }
+        fiscal_calendar_id:     { type: string }
+        parent_legal_entity_id: { type: string, nullable: true }
+        entity_status:          { type: string, enum: [ACTIVE, DORMANT, SUSPENDED, DISSOLVED] }
+        primary_jurisdiction_id: { type: string }
+        data_residency_policy_id: { type: string }
+        created_at:             { type: string, format: date-time }
+
+    CreateEntityRequest:
+      type: object
+      required: [tenant_id, entity_code, legal_name, entity_type, default_currency_code, fiscal_calendar_id, primary_jurisdiction_id, data_residency_policy_id, correlation_id]
+      properties:
+        tenant_id:              { type: string }
+        entity_code:            { type: string }
+        legal_name:             { type: string }
+        trading_name:           { type: string }
+        entity_type:            { type: string, enum: [SUBSIDIARY, BRANCH, HOLDING, OPERATIONAL] }
+        default_currency_code:  { type: string }
+        fiscal_calendar_id:     { type: string }
+        primary_jurisdiction_id:
+          type: string
+          description: Validated synchronously against Jurisdiction Rules Service (fail-closed).
+        data_residency_policy_id: { type: string }
+        correlation_id:         { type: string }
+
+    UpdateEntityRequest:
+      type: object
+      properties:
+        legal_name:           { type: string }
+        trading_name:         { type: string }
+        default_currency_code: { type: string }
+        correlation_id:       { type: string }
+
+    EntityStatusResponse:
+      type: object
+      description: Lightweight status probe response — no full entity payload.
+      properties:
+        entity_id:     { type: string }
+        tenant_id:     { type: string }
+        entity_status: { type: string, enum: [ACTIVE, DORMANT, SUSPENDED, DISSOLVED] }
+
+    TransitionEntityStatusRequest:
+      type: object
+      required: [new_status, correlation_id]
+      description: |
+        Publishes entity.status.changed on success.
+        Idempotent — same target status is a no-op.
+      properties:
+        new_status:
+          type: string
+          enum: [ACTIVE, DORMANT, SUSPENDED, DISSOLVED]
+        correlation_id: { type: string }
+
+    # ── EntityHierarchy ───────────────────────────────────────────────────────
+
+    EntityHierarchy:
+      type: object
+      properties:
+        hierarchy_id:           { type: string }
+        tenant_id:              { type: string }
+        parent_legal_entity_id: { type: string }
+        child_legal_entity_id:  { type: string }
+        relationship_type:      { type: string, enum: [OWNERSHIP, REPORTING, OPERATIONAL] }
+        effective_from:         { type: string, format: date-time }
+        effective_to:           { type: string, format: date-time, nullable: true }
+
+    CreateHierarchyRequest:
+      type: object
+      required: [tenant_id, parent_legal_entity_id, child_legal_entity_id, relationship_type, effective_from, correlation_id]
+      properties:
+        tenant_id:              { type: string }
+        parent_legal_entity_id: { type: string }
+        child_legal_entity_id:  { type: string }
+        relationship_type:      { type: string, enum: [OWNERSHIP, REPORTING, OPERATIONAL] }
+        effective_from:         { type: string, format: date-time }
+        correlation_id:         { type: string }
+
+    # ── EntityJurisdictionAssignment ──────────────────────────────────────────
+
+    EntityJurisdictionAssignment:
+      type: object
+      properties:
+        assignment_id:   { type: string }
+        legal_entity_id: { type: string }
+        jurisdiction_id: { type: string }
+        assignment_type: { type: string, enum: [PRIMARY, SECONDARY, TAX_ONLY, FILING_ONLY] }
+        effective_from:  { type: string, format: date-time }
+        effective_to:    { type: string, format: date-time, nullable: true }
+        source_basis:    { type: string }
+
+    AssignJurisdictionRequest:
+      type: object
+      required: [jurisdiction_id, assignment_type, effective_from, source_basis, correlation_id]
+      properties:
+        jurisdiction_id:
+          type: string
+          description: Validated synchronously against Jurisdiction Rules Service (fail-closed).
+        assignment_type: { type: string, enum: [PRIMARY, SECONDARY, TAX_ONLY, FILING_ONLY] }
+        effective_from:  { type: string, format: date-time }
+        source_basis:    { type: string }
+        correlation_id:  { type: string }
+
+    # ── DataResidencyPolicy ───────────────────────────────────────────────────
+
+    DataResidencyPolicy:
+      type: object
+      properties:
+        data_residency_policy_id: { type: string }
+        tenant_id:                { type: string }
+        policy_name:              { type: string }
+        policy_code:              { type: string }
+        residency_mode:           { type: string, enum: [STRICT_REGION, PREFERRED_REGION, FOLLOW_ENTITY] }
+        conflict_resolution_mode: { type: string, enum: [FAIL_CLOSED, LOG_AND_PROCEED, ESCALATE] }
+        active_flag:              { type: boolean }
+
+    CreateResidencyPolicyRequest:
+      type: object
+      required: [tenant_id, policy_name, policy_code, residency_mode, conflict_resolution_mode, correlation_id]
+      properties:
+        tenant_id:                { type: string }
+        policy_name:              { type: string }
+        policy_code:              { type: string }
+        residency_mode:           { type: string, enum: [STRICT_REGION, PREFERRED_REGION, FOLLOW_ENTITY] }
+        conflict_resolution_mode: { type: string, enum: [FAIL_CLOSED, LOG_AND_PROCEED, ESCALATE] }
+        correlation_id:           { type: string }
+
+    # ── ResidencyRegion (IaC-managed — no write schemas exposed) ─────────────
+
+    ResidencyRegion:
+      type: object
+      description: |
+        IaC-provisioned record. No create/update/delete endpoints exist on this service.
+        These records are managed exclusively via infrastructure-as-code (Terraform/CDK).
+      properties:
+        residency_region_id: { type: string }
+        region_code:         { type: string }
+        region_name:         { type: string }
+        cloud_provider:      { type: string }
+        country_code:        { type: string }
+        sovereign_flag:      { type: boolean }
+        active_flag:         { type: boolean }
+
+    # ── TaxIdentityBundle ─────────────────────────────────────────────────────
+
+    TaxIdentityBundle:
+      type: object
+      description: |
+        Structural header only — no tax identifier values stored here.
+        Fields: legal_entity_id, jurisdiction_id, effective dates, status.
+        The actual tax_registration_number and all evidence artifacts are
+        owned by the Tax Service.
+      properties:
+        tax_identity_bundle_id: { type: string }
+        legal_entity_id:        { type: string }
+        jurisdiction_id:        { type: string }
+        status:                 { type: string, enum: [PENDING, ACTIVE, EXPIRED, SUPERSEDED] }
+        effective_from:         { type: string, format: date-time }
+        effective_to:           { type: string, format: date-time, nullable: true }
+
+    CreateTaxIdentityBundleRequest:
+      type: object
+      required: [jurisdiction_id, effective_from, correlation_id]
+      description: |
+        Creates the structural header only — do NOT include tax identifier values here.
+        jurisdiction_id is validated synchronously (fail-closed).
+      properties:
+        jurisdiction_id:
+          type: string
+          description: Validated synchronously against Jurisdiction Rules Service (fail-closed).
+        effective_from: { type: string, format: date-time }
+        effective_to:   { type: string, format: date-time, nullable: true }
+        correlation_id: { type: string }
+
+    TransitionTaxIdentityBundleStatusRequest:
+      type: object
+      required: [new_status, correlation_id]
+      properties:
+        new_status:
+          type: string
+          enum: [PENDING, ACTIVE, EXPIRED, SUPERSEDED]
+        correlation_id: { type: string }
+
+    # ── Health ────────────────────────────────────────────────────────────────
+
+    HealthResponse:
+      type: object
+      properties:
+        status:    { type: string }
+        timestamp: { type: string, format: date-time }
+        service:   { type: string }
+
+    # ── Error ─────────────────────────────────────────────────────────────────
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:          { type: string }
+        correlation_id: { type: string }
+
+  responses:
+    BadRequest:
+      description: Invalid request body or missing required fields
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    Forbidden:
+      description: Authorization denied
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    UnprocessableEntity:
+      description: Invalid state transition
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    ServiceUnavailable:
+      description: Upstream service (AuthZ or Jurisdiction Rules) unreachable — request rejected fail-closed
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
