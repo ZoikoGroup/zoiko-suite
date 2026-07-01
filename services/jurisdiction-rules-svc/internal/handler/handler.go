@@ -4,6 +4,10 @@
 // it unblocks tenant-entity-registry-svc immediately. The contract matches
 // exactly what HTTPJurisdictionValidator in tenant-entity-registry-svc expects:
 //
+// correlationIDMiddleware is applied inside RegisterRoutes so that the echo
+// behaviour is exercised by handler-level tests without requiring the full
+// main.go server stack.
+//
 //	200 OK        → jurisdiction exists, active_flag=true, not expired
 //	404 Not Found → jurisdiction_id unknown, inactive, or expired
 //	503           → database unavailable (callers must fail-closed)
@@ -43,14 +47,31 @@ func New(store JurisdictionStore, log *zap.Logger) *Handler {
 }
 
 // RegisterRoutes mounts all routes on the given chi router.
-// Follows the same pattern as tenant-entity-registry-svc for consistency.
+// correlationIDMiddleware is applied at the router level so every response
+// carries an X-Correlation-ID regardless of path — this makes the behaviour
+// testable in unit tests that build their own router via this function.
 func RegisterRoutes(r chi.Router, h *Handler) {
+	r.Use(correlationIDMiddleware)
+
 	// ── Public read (no AuthZ required) ──────────────────────────────────────
 	r.Get("/v1/jurisdictions/{jurisdiction_id}", h.GetJurisdiction)
 
 	// ── Admin mutations (AuthZ required — wired in next scaffold step) ────────
 	// r.Post("/v1/admin/jurisdictions", h.CreateJurisdiction)
 	// r.Post("/v1/admin/jurisdictions/{jurisdiction_id}/deactivate", h.DeactivateJurisdiction)
+}
+
+// correlationIDMiddleware echoes X-Correlation-ID from the request into the
+// response on every route registered via RegisterRoutes. If the header is
+// absent the response will carry an empty string — injection of a fresh ID
+// when absent is handled by the server-level middleware in main.go.
+func correlationIDMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if id := r.Header.Get("X-Correlation-ID"); id != "" {
+			w.Header().Set("X-Correlation-ID", id)
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // GetJurisdiction handles GET /v1/jurisdictions/{jurisdiction_id}.
