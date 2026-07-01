@@ -13,6 +13,7 @@ import (
 
 	"zoiko.io/jurisdiction-rules-svc/internal/domain"
 	"zoiko.io/jurisdiction-rules-svc/internal/handler"
+	"zoiko.io/jurisdiction-rules-svc/internal/store"
 )
 
 // ── stub store ────────────────────────────────────────────────────────────────
@@ -20,12 +21,22 @@ import (
 // stubStore implements handler.JurisdictionStore for unit testing.
 // No DB, no network — purely in-memory.
 type stubStore struct {
-	jurisdiction *domain.Jurisdiction
-	err          error
+	jurisdiction  *domain.Jurisdiction
+	jurisdictions []*domain.Jurisdiction
+	ancestors     []*domain.Jurisdiction
+	err           error
 }
 
 func (s *stubStore) FindByID(_ context.Context, _ string) (*domain.Jurisdiction, error) {
 	return s.jurisdiction, s.err
+}
+
+func (s *stubStore) List(_ context.Context, _ store.ListParams) ([]*domain.Jurisdiction, error) {
+	return s.jurisdictions, s.err
+}
+
+func (s *stubStore) FindAncestors(_ context.Context, _ string) ([]*domain.Jurisdiction, error) {
+	return s.ancestors, s.err
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -202,3 +213,154 @@ func TestGetJurisdiction_CorrelationID(t *testing.T) {
 		})
 	}
 }
+
+// ── ListJurisdictions tests ───────────────────────────────────────────────────
+
+// TestListJurisdictions_200_ReturnsArray verifies that a successful store.List
+// returns 200 with a JSON array body.
+func TestListJurisdictions_200_ReturnsArray(t *testing.T) {
+	items := []*domain.Jurisdiction{
+		{JurisdictionID: "aaa", JurisdictionCode: "DE", JurisdictionType: "COUNTRY", SchemaVersion: "1.0"},
+		{JurisdictionID: "bbb", JurisdictionCode: "FR", JurisdictionType: "COUNTRY", SchemaVersion: "1.0"},
+	}
+	h := newTestRouter(&stubStore{jurisdictions: items})
+	req := httptest.NewRequest(http.MethodGet, "/v1/jurisdictions?type=COUNTRY&active=true", nil)
+
+	rr := executeRequest(h, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d — body: %s", rr.Code, rr.Body.String())
+	}
+	var got []domain.Jurisdiction
+	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
+		t.Fatalf("failed to decode list body: %v", err)
+	}
+	if len(got) != 2 {
+		t.Errorf("expected 2 jurisdictions, got %d", len(got))
+	}
+}
+
+// TestListJurisdictions_200_EmptyArrayNotNull ensures that when the store
+// returns nil (no rows), the handler still returns [] and NOT null.
+// Callers that iterate the JSON array must not get a null-pointer surprise.
+func TestListJurisdictions_200_EmptyArrayNotNull(t *testing.T) {
+	h := newTestRouter(&stubStore{jurisdictions: nil})
+	req := httptest.NewRequest(http.MethodGet, "/v1/jurisdictions", nil)
+
+	rr := executeRequest(h, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rr.Code)
+	}
+	body := rr.Body.String()
+	// Must start with "[" not "null".
+	if len(body) == 0 || body[0] != '[' {
+		t.Errorf("expected JSON array, got: %s", body)
+	}
+}
+
+// TestListJurisdictions_503_StoreUnavailable verifies that a store error
+// on List returns 503.
+func TestListJurisdictions_503_StoreUnavailable(t *testing.T) {
+	h := newTestRouter(&stubStore{err: domain.ErrStoreUnavailable})
+	req := httptest.NewRequest(http.MethodGet, "/v1/jurisdictions", nil)
+
+	rr := executeRequest(h, req)
+
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d — body: %s", rr.Code, rr.Body.String())
+	}
+	var body map[string]string
+	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+		t.Fatalf("failed to decode error body: %v", err)
+	}
+	if body["error"] != "store_unavailable" {
+		t.Errorf("expected error=store_unavailable, got %q", body["error"])
+	}
+}
+
+// ── GetAncestors tests ────────────────────────────────────────────────────────
+
+// TestGetAncestors_200_Chain verifies that a non-empty ancestor list returns
+// 200 with an ordered JSON array.
+func TestGetAncestors_200_Chain(t *testing.T) {
+	chain := []*domain.Jurisdiction{
+		{JurisdictionID: "parent-id", JurisdictionCode: "EU", JurisdictionType: "SUPRANATIONAL", SchemaVersion: "1.0"},
+	}
+	h := newTestRouter(&stubStore{ancestors: chain})
+	req := httptest.NewRequest(http.MethodGet, "/v1/jurisdictions/child-id/ancestors", nil)
+
+	rr := executeRequest(h, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d — body: %s", rr.Code, rr.Body.String())
+	}
+	var got []domain.Jurisdiction
+	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
+		t.Fatalf("failed to decode ancestors body: %v", err)
+	}
+	if len(got) != 1 {
+		t.Errorf("expected 1 ancestor, got %d", len(got))
+	}
+	if got[0].JurisdictionID != "parent-id" {
+		t.Errorf("expected ancestor ID parent-id, got %q", got[0].JurisdictionID)
+	}
+}
+
+// TestGetAncestors_200_RootReturnsEmptyArray verifies that a root jurisdiction
+// (no parent) returns 200 with an empty array — NOT 404.
+func TestGetAncestors_200_RootReturnsEmptyArray(t *testing.T) {
+	h := newTestRouter(&stubStore{ancestors: nil}) // nil = root, no ancestors
+	req := httptest.NewRequest(http.MethodGet, "/v1/jurisdictions/root-id/ancestors", nil)
+
+	rr := executeRequest(h, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 for root jurisdiction, got %d", rr.Code)
+	}
+	body := rr.Body.String()
+	if len(body) == 0 || body[0] != '[' {
+		t.Errorf("expected empty JSON array [], got: %s", body)
+	}
+}
+
+// TestGetAncestors_404_JurisdictionNotFound verifies that an unknown
+// jurisdiction_id returns 404 from the ancestors endpoint.
+func TestGetAncestors_404_JurisdictionNotFound(t *testing.T) {
+	h := newTestRouter(&stubStore{err: domain.ErrJurisdictionNotFound})
+	req := httptest.NewRequest(http.MethodGet, "/v1/jurisdictions/unknown-id/ancestors", nil)
+
+	rr := executeRequest(h, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d — body: %s", rr.Code, rr.Body.String())
+	}
+	var body map[string]string
+	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+		t.Fatalf("failed to decode error body: %v", err)
+	}
+	if body["error"] != "jurisdiction_not_found" {
+		t.Errorf("expected error=jurisdiction_not_found, got %q", body["error"])
+	}
+}
+
+// TestGetAncestors_503_StoreUnavailable verifies that a database failure
+// during ancestor traversal returns 503 — not 404.
+func TestGetAncestors_503_StoreUnavailable(t *testing.T) {
+	h := newTestRouter(&stubStore{err: domain.ErrStoreUnavailable})
+	req := httptest.NewRequest(http.MethodGet, "/v1/jurisdictions/any-id/ancestors", nil)
+
+	rr := executeRequest(h, req)
+
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d — body: %s", rr.Code, rr.Body.String())
+	}
+	var body map[string]string
+	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+		t.Fatalf("failed to decode error body: %v", err)
+	}
+	if body["error"] != "store_unavailable" {
+		t.Errorf("expected error=store_unavailable, got %q", body["error"])
+	}
+}
+
